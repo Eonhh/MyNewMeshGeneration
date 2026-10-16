@@ -169,11 +169,7 @@ bool circumcenter(
     return radius_squared > 1.0e-24 && std::isfinite(radius_squared);
 }
 
-double tet_quality(const BaseMesh& mesh, const Tetrahedron& tet) {
-    std::array<Point3d, 4> p{{
-        mesh.points[tet.point_ids[0]], mesh.points[tet.point_ids[1]],
-        mesh.points[tet.point_ids[2]], mesh.points[tet.point_ids[3]],
-    }};
+double tet_quality_vertices(const std::array<Point3d, 4>& p) {
     const double volume6 = std::abs(signed_six_volume(p[0], p[1], p[2], p[3]));
     if (!(volume6 > 1.0e-30)) {
         return 0.0;
@@ -188,6 +184,13 @@ double tet_quality(const BaseMesh& mesh, const Tetrahedron& tet) {
         return 0.0;
     }
     return 3.0 * (0.5 * volume6 / area) / std::sqrt(radius_squared);
+}
+
+double tet_quality(const BaseMesh& mesh, const Tetrahedron& tet) {
+    return tet_quality_vertices({{
+        mesh.points[tet.point_ids[0]], mesh.points[tet.point_ids[1]],
+        mesh.points[tet.point_ids[2]], mesh.points[tet.point_ids[3]],
+    }});
 }
 
 bool make_tet(
@@ -209,6 +212,41 @@ bool make_tet(
     if (!(std::abs(signed_six_volume(
               mesh.points[ids[0]], mesh.points[ids[1]],
               mesh.points[ids[2]], mesh.points[ids[3]])) > 1.0e-30)) {
+        return false;
+    }
+    result.point_ids = ids;
+    result.refinement_level = parent.refinement_level;
+    result.refinement_kind = static_cast<std::uint8_t>(kind);
+    return true;
+}
+
+bool make_candidate_tet(
+    const BaseMesh& mesh,
+    std::array<std::uint32_t, 4> ids,
+    const Tetrahedron& parent,
+    TetrahedronRefinementKind kind,
+    std::uint32_t appended_id,
+    const Point3d& appended_point,
+    double minimum_quality,
+    Tetrahedron& result) {
+    std::array<std::uint32_t, 4> unique = ids;
+    std::sort(unique.begin(), unique.end());
+    if (std::adjacent_find(unique.begin(), unique.end()) != unique.end()) {
+        return false;
+    }
+    std::array<Point3d, 4> vertices{};
+    for (std::size_t index = 0; index < ids.size(); ++index) {
+        if (ids[index] == appended_id) {
+            vertices[index] = appended_point;
+        } else if (ids[index] < mesh.points.size()) {
+            vertices[index] = mesh.points[ids[index]];
+        } else {
+            return false;
+        }
+    }
+    if (!(std::abs(signed_six_volume(
+              vertices[0], vertices[1], vertices[2], vertices[3])) > 1.0e-30) ||
+        tet_quality_vertices(vertices) < minimum_quality) {
         return false;
     }
     result.point_ids = ids;
@@ -286,6 +324,162 @@ void insert_split_node_in_paths(
     }
 }
 
+struct PointInsertionPlan {
+    Point3d point{};
+    int node_type = 20;
+    std::vector<std::pair<std::size_t, Tetrahedron>> replacements;
+    std::vector<Tetrahedron> appended;
+    std::optional<EdgeKey> midpoint_edge;
+};
+
+class LocalEditJournal {
+public:
+    explicit LocalEditJournal(FeatureEdgePreservationResult& result)
+        : result_(result),
+          point_count_(result.mesh.points.size()),
+          tet_count_(result.mesh.tetrahedra.size()),
+          midpoint_count_(result.mesh.registered_edge_midpoints.size()),
+          node_type_count_(result.node_types.size()),
+          edge_split_count_(result.edge_split_count),
+          face_split_count_(result.face_split_count),
+          forced_edge_split_count_(result.forced_edge_split_count),
+          forced_face_split_count_(result.forced_face_split_count),
+          edge_swap_count_(result.edge_swap_count) {}
+
+    LocalEditJournal(const LocalEditJournal&) = delete;
+    LocalEditJournal& operator=(const LocalEditJournal&) = delete;
+
+    ~LocalEditJournal() {
+        if (active_) {
+            rollback();
+        }
+    }
+
+    void remember_tet(std::size_t id) {
+        if (id >= tet_count_ || remembered_tets_.count(id) != 0U) {
+            return;
+        }
+        remembered_tets_.insert(id);
+        original_tets_.push_back({id, result_.mesh.tetrahedra[id]});
+    }
+
+    void remember_midpoint(std::size_t id) {
+        if (id >= midpoint_count_ || remembered_midpoints_.count(id) != 0U) {
+            return;
+        }
+        remembered_midpoints_.insert(id);
+        original_midpoints_.push_back(
+            {id, result_.mesh.registered_edge_midpoints[id]});
+    }
+
+    void note_edge_split(const EdgeKey& edge, std::uint32_t inserted) {
+        edge_splits_.push_back({edge, inserted});
+    }
+
+    void commit() {
+        for (const auto& split : edge_splits_) {
+            insert_split_node_in_paths(&result_, split.first, split.second);
+        }
+        active_ = false;
+    }
+
+    void rollback() {
+        result_.mesh.points.resize(point_count_);
+        result_.mesh.tetrahedra.resize(tet_count_);
+        result_.mesh.registered_edge_midpoints.resize(midpoint_count_);
+        result_.node_types.resize(node_type_count_);
+        for (const auto& item : original_tets_) {
+            result_.mesh.tetrahedra[item.first] = item.second;
+        }
+        for (const auto& item : original_midpoints_) {
+            result_.mesh.registered_edge_midpoints[item.first] = item.second;
+        }
+        result_.edge_split_count = edge_split_count_;
+        result_.face_split_count = face_split_count_;
+        result_.forced_edge_split_count = forced_edge_split_count_;
+        result_.forced_face_split_count = forced_face_split_count_;
+        result_.edge_swap_count = edge_swap_count_;
+        active_ = false;
+    }
+
+private:
+    FeatureEdgePreservationResult& result_;
+    std::size_t point_count_ = 0;
+    std::size_t tet_count_ = 0;
+    std::size_t midpoint_count_ = 0;
+    std::size_t node_type_count_ = 0;
+    std::size_t edge_split_count_ = 0;
+    std::size_t face_split_count_ = 0;
+    std::size_t forced_edge_split_count_ = 0;
+    std::size_t forced_face_split_count_ = 0;
+    std::size_t edge_swap_count_ = 0;
+    std::unordered_set<std::size_t> remembered_tets_;
+    std::unordered_set<std::size_t> remembered_midpoints_;
+    std::vector<std::pair<std::size_t, Tetrahedron>> original_tets_;
+    std::vector<std::pair<std::size_t, RegisteredEdgeMidpoint>>
+        original_midpoints_;
+    std::vector<std::pair<EdgeKey, std::uint32_t>> edge_splits_;
+    bool active_ = true;
+};
+
+bool apply_point_insertion_plan(
+    BaseMesh& mesh,
+    std::vector<int>* node_types,
+    FeatureEdgePreservationResult* result,
+    LocalEditJournal* journal,
+    const PointInsertionPlan& plan,
+    std::uint32_t& inserted) {
+    inserted = static_cast<std::uint32_t>(mesh.points.size());
+    mesh.points.reserve(mesh.points.size() + 1U);
+    mesh.tetrahedra.reserve(mesh.tetrahedra.size() + plan.appended.size());
+    if (node_types != nullptr) {
+        node_types->reserve(node_types->size() + 1U);
+    }
+    if (plan.midpoint_edge.has_value()) {
+        mesh.registered_edge_midpoints.reserve(
+            mesh.registered_edge_midpoints.size() + 1U);
+    }
+    mesh.points.push_back(plan.point);
+    if (node_types != nullptr) {
+        node_types->push_back(plan.node_type);
+    }
+    for (const auto& replacement : plan.replacements) {
+        if (journal != nullptr) {
+            journal->remember_tet(replacement.first);
+        }
+        mesh.tetrahedra[replacement.first] = replacement.second;
+    }
+    mesh.tetrahedra.insert(
+        mesh.tetrahedra.end(), plan.appended.begin(), plan.appended.end());
+    if (plan.midpoint_edge.has_value()) {
+        bool found = false;
+        for (std::size_t index = 0;
+             index < mesh.registered_edge_midpoints.size(); ++index) {
+            RegisteredEdgeMidpoint& record =
+                mesh.registered_edge_midpoints[index];
+            if (EdgeKey(record.edge_point_ids[0], record.edge_point_ids[1]) ==
+                *plan.midpoint_edge) {
+                if (journal != nullptr) {
+                    journal->remember_midpoint(index);
+                }
+                record.midpoint_id = inserted;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            mesh.registered_edge_midpoints.push_back(
+                {{{plan.midpoint_edge->a, plan.midpoint_edge->b}}, inserted});
+        }
+        if (journal != nullptr) {
+            journal->note_edge_split(*plan.midpoint_edge, inserted);
+        } else {
+            insert_split_node_in_paths(result, *plan.midpoint_edge, inserted);
+        }
+    }
+    return true;
+}
+
 bool split_edge(
     BaseMesh& mesh,
     std::vector<int>* node_types,
@@ -294,21 +488,23 @@ bool split_edge(
     const Point3d& point,
     std::size_t maximum_tets,
     double minimum_quality,
+    LocalEditJournal* journal,
     std::uint32_t& inserted) {
     const std::vector<std::size_t> ring = tets_around_edge(mesh, edge);
     if (ring.empty() || ring.size() > maximum_tets ||
         mesh.tetrahedra.size() > maximum_tets - ring.size()) {
         return false;
     }
-    BaseMesh trial = mesh;
-    inserted = static_cast<std::uint32_t>(trial.points.size());
-    trial.points.push_back(point);
-    std::vector<Tetrahedron> replacements;
-    std::vector<Tetrahedron> appended;
-    replacements.reserve(ring.size());
-    appended.reserve(ring.size());
+    const std::uint32_t candidate_id =
+        static_cast<std::uint32_t>(mesh.points.size());
+    PointInsertionPlan plan;
+    plan.point = point;
+    plan.node_type = 20;
+    plan.midpoint_edge = edge;
+    plan.replacements.reserve(ring.size());
+    plan.appended.reserve(ring.size());
     for (const std::size_t tet_id : ring) {
-        const Tetrahedron parent = trial.tetrahedra[tet_id];
+        const Tetrahedron parent = mesh.tetrahedra[tet_id];
         std::array<std::uint32_t, 2> other{};
         std::size_t count = 0;
         for (const std::uint32_t id : parent.point_ids) {
@@ -319,39 +515,22 @@ bool split_edge(
         Tetrahedron first;
         Tetrahedron second;
         if (count != 2U ||
-            !make_tet(trial, {{inserted, edge.a, other[0], other[1]}}, parent,
-                      TetrahedronRefinementKind::feature_edge_split, first) ||
-            !make_tet(trial, {{inserted, edge.b, other[0], other[1]}}, parent,
-                      TetrahedronRefinementKind::feature_edge_split, second) ||
-            tet_quality(trial, first) < minimum_quality ||
-            tet_quality(trial, second) < minimum_quality) {
+            !make_candidate_tet(
+                mesh, {{candidate_id, edge.a, other[0], other[1]}}, parent,
+                TetrahedronRefinementKind::feature_edge_split, candidate_id,
+                point, minimum_quality, first) ||
+            !make_candidate_tet(
+                mesh, {{candidate_id, edge.b, other[0], other[1]}}, parent,
+                TetrahedronRefinementKind::feature_edge_split, candidate_id,
+                point, minimum_quality, second)) {
             inserted = invalid_point;
             return false;
         }
-        replacements.push_back(first);
-        appended.push_back(second);
+        plan.replacements.push_back({tet_id, first});
+        plan.appended.push_back(second);
     }
-    for (std::size_t index = 0; index < ring.size(); ++index) {
-        trial.tetrahedra[ring[index]] = replacements[index];
-    }
-    trial.tetrahedra.insert(trial.tetrahedra.end(), appended.begin(), appended.end());
-    bool found_midpoint = false;
-    for (RegisteredEdgeMidpoint& record : trial.registered_edge_midpoints) {
-        if (EdgeKey(record.edge_point_ids[0], record.edge_point_ids[1]) == edge) {
-            record.midpoint_id = inserted;
-            found_midpoint = true;
-            break;
-        }
-    }
-    if (!found_midpoint) {
-        trial.registered_edge_midpoints.push_back({{{edge.a, edge.b}}, inserted});
-    }
-    mesh = std::move(trial);
-    if (node_types != nullptr) {
-        node_types->push_back(20);
-    }
-    insert_split_node_in_paths(result, edge, inserted);
-    return true;
+    return apply_point_insertion_plan(
+        mesh, node_types, result, journal, plan, inserted);
 }
 
 bool split_face(
@@ -361,6 +540,7 @@ bool split_face(
     const Point3d& point,
     std::size_t maximum_tets,
     double minimum_quality,
+    LocalEditJournal* journal,
     std::uint32_t& inserted) {
     const std::vector<std::size_t> parents = tets_around_face(mesh, face);
     const std::size_t added = 2U * parents.size();
@@ -368,12 +548,16 @@ bool split_face(
         mesh.tetrahedra.size() > maximum_tets - added) {
         return false;
     }
-    BaseMesh trial = mesh;
-    inserted = static_cast<std::uint32_t>(trial.points.size());
-    trial.points.push_back(point);
+    const std::uint32_t candidate_id =
+        static_cast<std::uint32_t>(mesh.points.size());
+    PointInsertionPlan plan;
+    plan.point = point;
+    plan.node_type = 20;
+    plan.replacements.reserve(parents.size());
+    plan.appended.reserve(2U * parents.size());
     std::vector<std::array<Tetrahedron, 3>> children(parents.size());
     for (std::size_t side = 0; side < parents.size(); ++side) {
-        const Tetrahedron parent = trial.tetrahedra[parents[side]];
+        const Tetrahedron parent = mesh.tetrahedra[parents[side]];
         std::uint32_t apex = invalid_point;
         for (const std::uint32_t id : parent.point_ids) {
             if (id != face[0] && id != face[1] && id != face[2]) {
@@ -386,27 +570,24 @@ bool split_face(
             return false;
         }
         for (std::size_t edge = 0; edge < 3U; ++edge) {
-            if (!make_tet(
-                    trial,
-                    {{apex, face[edge], face[(edge + 1U) % 3U], inserted}},
+            if (!make_candidate_tet(
+                    mesh,
+                    {{apex, face[edge], face[(edge + 1U) % 3U], candidate_id}},
                     parent, TetrahedronRefinementKind::feature_face_split,
-                    children[side][edge]) ||
-                tet_quality(trial, children[side][edge]) < minimum_quality) {
+                    candidate_id, point, minimum_quality,
+                    children[side][edge])) {
                 inserted = invalid_point;
                 return false;
             }
         }
     }
     for (std::size_t side = 0; side < parents.size(); ++side) {
-        trial.tetrahedra[parents[side]] = children[side][0];
-        trial.tetrahedra.push_back(children[side][1]);
-        trial.tetrahedra.push_back(children[side][2]);
+        plan.replacements.push_back({parents[side], children[side][0]});
+        plan.appended.push_back(children[side][1]);
+        plan.appended.push_back(children[side][2]);
     }
-    mesh = std::move(trial);
-    if (node_types != nullptr) {
-        node_types->push_back(20);
-    }
-    return true;
+    return apply_point_insertion_plan(
+        mesh, node_types, nullptr, journal, plan, inserted);
 }
 
 bool split_tetrahedron(
@@ -416,36 +597,38 @@ bool split_tetrahedron(
     const Point3d& point,
     std::size_t maximum_tets,
     double minimum_quality,
+    LocalEditJournal* journal,
     std::uint32_t& inserted) {
     if (tet_id >= mesh.tetrahedra.size() || maximum_tets < 3U ||
         mesh.tetrahedra.size() > maximum_tets - 3U) {
         return false;
     }
-    BaseMesh trial = mesh;
-    inserted = static_cast<std::uint32_t>(trial.points.size());
-    trial.points.push_back(point);
-    const Tetrahedron parent = trial.tetrahedra[tet_id];
+    const std::uint32_t candidate_id =
+        static_cast<std::uint32_t>(mesh.points.size());
+    const Tetrahedron parent = mesh.tetrahedra[tet_id];
+    PointInsertionPlan plan;
+    plan.point = point;
+    plan.node_type = 18;
+    plan.replacements.reserve(1U);
+    plan.appended.reserve(3U);
     std::array<Tetrahedron, 4> children{};
     for (std::size_t face = 0; face < 4U; ++face) {
         const auto local = tet_faces[face];
-        if (!make_tet(
-                trial,
-                {{inserted, parent.point_ids[local[0]], parent.point_ids[local[1]],
+        if (!make_candidate_tet(
+                mesh,
+                {{candidate_id, parent.point_ids[local[0]], parent.point_ids[local[1]],
                   parent.point_ids[local[2]]}},
                 parent, TetrahedronRefinementKind::node_face_split,
-                children[face]) ||
-            tet_quality(trial, children[face]) < minimum_quality) {
+                candidate_id, point, minimum_quality, children[face])) {
             inserted = invalid_point;
             return false;
         }
     }
-    trial.tetrahedra[tet_id] = children[0];
-    trial.tetrahedra.insert(trial.tetrahedra.end(), children.begin() + 1, children.end());
-    mesh = std::move(trial);
-    if (node_types != nullptr) {
-        node_types->push_back(18);
-    }
-    return true;
+    plan.replacements.push_back({tet_id, children[0]});
+    plan.appended.insert(
+        plan.appended.end(), children.begin() + 1, children.end());
+    return apply_point_insertion_plan(
+        mesh, node_types, nullptr, journal, plan, inserted);
 }
 
 std::array<double, 4> tet_barycentric(
@@ -526,7 +709,7 @@ bool materialize_point(
             if (split_edge(mesh, nullptr, nullptr,
                            EdgeKey(tet.point_ids[nonzeros[0]], tet.point_ids[nonzeros[1]]),
                            point, options.primary.maximum_tetrahedron_count,
-                           options.minimum_fallback_quality, point_id)) {
+                           options.minimum_fallback_quality, nullptr, point_id)) {
                 state = FeatureNodePreservationState::inserted_by_edge_split;
                 return true;
             }
@@ -540,7 +723,7 @@ bool materialize_point(
             }};
             if (split_face(mesh, nullptr, face, point,
                            options.primary.maximum_tetrahedron_count,
-                           options.minimum_fallback_quality, point_id)) {
+                           options.minimum_fallback_quality, nullptr, point_id)) {
                 state = FeatureNodePreservationState::inserted_by_face_split;
                 return true;
             }
@@ -548,7 +731,8 @@ bool materialize_point(
         }
         if (split_tetrahedron(mesh, nullptr, tet_id, point,
                               options.primary.maximum_tetrahedron_count,
-                              options.minimum_fallback_quality, point_id)) {
+                              options.minimum_fallback_quality, nullptr,
+                              point_id)) {
             state = FeatureNodePreservationState::inserted_by_face_split;
             return true;
         }
@@ -854,6 +1038,7 @@ bool advance_crossing(
     FeatureEdgePreservationResult& result,
     const Crossing& crossing,
     const FeatureEdgePreservationV2Options& options,
+    LocalEditJournal& journal,
     std::uint32_t& next) {
     const double tolerance = std::max(
         options.primary.global_tolerance, options.primary.mesh_tolerance);
@@ -883,7 +1068,7 @@ bool advance_crossing(
         if (!split_edge(result.mesh, &result.node_types, &result,
                         split_candidate, crossing.point,
                         options.primary.maximum_tetrahedron_count,
-                        options.minimum_fallback_quality, next)) {
+                        options.minimum_fallback_quality, &journal, next)) {
             return false;
         }
         ++result.edge_split_count;
@@ -892,7 +1077,7 @@ bool advance_crossing(
     }
     if (!split_face(result.mesh, &result.node_types, crossing.face,
                     crossing.point, options.primary.maximum_tetrahedron_count,
-                    options.minimum_fallback_quality, next)) {
+                    options.minimum_fallback_quality, &journal, next)) {
         return false;
     }
     ++result.face_split_count;
@@ -907,6 +1092,7 @@ bool recover_by_robust_walk(
     const Point3d& line_start,
     const Point3d& line_end,
     const FeatureEdgePreservationV2Options& options,
+    LocalEditJournal& journal,
     std::vector<std::uint32_t>& path) {
     const double tolerance = std::max(
         options.primary.mesh_tolerance, options.primary.preserve_tolerance);
@@ -929,7 +1115,7 @@ bool recover_by_robust_walk(
             return false;
         }
         std::uint32_t next = invalid_point;
-        if (!advance_crossing(result, crossing, options, next) ||
+        if (!advance_crossing(result, crossing, options, journal, next) ||
             next == invalid_point || next == current ||
             !visited.insert(next).second ||
             !mesh_has_edge(result.mesh, current, next)) {
@@ -946,33 +1132,32 @@ bool try_direct_two_to_three_swap(
     std::uint32_t start,
     std::uint32_t target,
     const FeatureEdgePreservationV2Options& options) {
-    std::unordered_map<FaceKey, std::vector<std::size_t>, FaceHash> faces;
-    faces.reserve(result.mesh.tetrahedra.size() * 2U);
-    for (std::size_t tet_id = 0; tet_id < result.mesh.tetrahedra.size(); ++tet_id) {
-        const Tetrahedron& tet = result.mesh.tetrahedra[tet_id];
-        for (const auto& local : tet_faces) {
-            faces[FaceKey({{tet.point_ids[local[0]], tet.point_ids[local[1]],
-                           tet.point_ids[local[2]]}})].push_back(tet_id);
-        }
-    }
-    for (const auto& item : faces) {
-        if (item.second.size() != 2U) {
-            continue;
-        }
-        const std::array<std::uint32_t, 3>& face = item.first.ids;
-        std::array<std::uint32_t, 2> apex{{invalid_point, invalid_point}};
-        for (std::size_t side = 0; side < 2U; ++side) {
-            for (const std::uint32_t id : result.mesh.tetrahedra[item.second[side]].point_ids) {
-                if (std::find(face.begin(), face.end(), id) == face.end()) {
-                    apex[side] = id;
-                    break;
+    const std::vector<std::size_t> start_tets =
+        tets_around_point(result.mesh, start);
+    const std::vector<std::size_t> target_tets =
+        tets_around_point(result.mesh, target);
+    for (const std::size_t first_id : start_tets) {
+        for (const std::size_t second_id : target_tets) {
+            const Tetrahedron& first_tet = result.mesh.tetrahedra[first_id];
+            const Tetrahedron& second_tet = result.mesh.tetrahedra[second_id];
+            std::array<std::uint32_t, 3> face{};
+            std::size_t shared_count = 0;
+            for (const std::uint32_t id : first_tet.point_ids) {
+                if (std::find(
+                        second_tet.point_ids.begin(), second_tet.point_ids.end(),
+                        id) != second_tet.point_ids.end()) {
+                    if (shared_count < face.size()) {
+                        face[shared_count] = id;
+                    }
+                    ++shared_count;
                 }
             }
-        }
-        if (!((apex[0] == start && apex[1] == target) ||
-              (apex[0] == target && apex[1] == start))) {
-            continue;
-        }
+            if (shared_count != 3U ||
+                std::find(face.begin(), face.end(), start) != face.end() ||
+                std::find(face.begin(), face.end(), target) != face.end()) {
+                continue;
+            }
+            const std::array<std::uint32_t, 2> apex{{start, target}};
         const double side0 = signed_six_volume(
             result.mesh.points[face[0]], result.mesh.points[face[1]],
             result.mesh.points[face[2]], result.mesh.points[apex[0]]);
@@ -1013,28 +1198,29 @@ bool try_direct_two_to_three_swap(
         if (alpha < -1.0e-10 || beta < -1.0e-10 || gamma < -1.0e-10) {
             continue;
         }
-        BaseMesh trial = result.mesh;
-        const Tetrahedron parent = trial.tetrahedra[item.second[0]];
+        const Tetrahedron parent = result.mesh.tetrahedra[first_id];
         std::array<Tetrahedron, 3> children{};
         bool valid = true;
         for (std::size_t edge = 0; edge < 3U; ++edge) {
             valid = valid && make_tet(
-                trial,
+                result.mesh,
                 {{start, target, face[edge], face[(edge + 1U) % 3U]}},
                 parent, TetrahedronRefinementKind::feature_edge_swap,
                 children[edge]);
             valid = valid &&
-                    tet_quality(trial, children[edge]) >= options.minimum_fallback_quality;
+                    tet_quality(result.mesh, children[edge]) >=
+                        options.minimum_fallback_quality;
         }
         if (!valid) {
             continue;
         }
-        trial.tetrahedra[item.second[0]] = children[0];
-        trial.tetrahedra[item.second[1]] = children[1];
-        trial.tetrahedra.push_back(children[2]);
-        result.mesh = std::move(trial);
+        result.mesh.tetrahedra.reserve(result.mesh.tetrahedra.size() + 1U);
+        result.mesh.tetrahedra[first_id] = children[0];
+        result.mesh.tetrahedra[second_id] = children[1];
+        result.mesh.tetrahedra.push_back(children[2]);
         ++result.edge_swap_count;
         return true;
+        }
     }
     return false;
 }
@@ -1136,7 +1322,7 @@ bool reduce_one_multi_cut_edge(
     if (!split_edge(
             result.mesh, &result.node_types, &result, *selected_edge,
             selected_cut->point, options.primary.maximum_tetrahedron_count,
-            options.minimum_fallback_quality, inserted)) {
+            options.minimum_fallback_quality, nullptr, inserted)) {
         return false;
     }
     ++result.edge_split_count;
@@ -1247,7 +1433,7 @@ bool valid_v2_options(const FeatureEdgePreservationV2Options& options) {
 }  // namespace
 
 bool preserve_feature_edges_v2(
-    const NodePreservationResult& node_result,
+    NodePreservationResult&& node_result,
     const FacetMesh& facet_mesh,
     const FeatureTopology& features,
     const FeatureEdgePreservationV2Options& options,
@@ -1260,7 +1446,7 @@ bool preserve_feature_edges_v2(
         return false;
     }
 
-    NodePreservationResult repaired = node_result;
+    NodePreservationResult repaired = std::move(node_result);
     std::unordered_set<std::size_t> noncollapsible_same_node;
     std::size_t endpoint_insertions = 0;
     for (std::size_t feature_index = 0;
@@ -1310,7 +1496,8 @@ bool preserve_feature_edges_v2(
     }
 
     if (!preserve_feature_edges(
-            repaired, facet_mesh, features, options.primary, output, error)) {
+            std::move(repaired), facet_mesh, features, options.primary,
+            output, error)) {
         return false;
     }
     output.endpoint_insertion_count = endpoint_insertions;
@@ -1378,10 +1565,8 @@ bool preserve_feature_edges_v2(
         // several outstanding constraints.  Split one highest-conflict edge
         // per pass, then let the refresh/walk stages consume the new vertex.
         if (options.enable_multi_cut_reduction) {
-            FeatureEdgePreservationResult multi_cut_trial = output;
             if (reduce_one_multi_cut_edge(
-                    multi_cut_trial, repaired, facet_mesh, features, options)) {
-                output = std::move(multi_cut_trial);
+                    output, repaired, facet_mesh, features, options)) {
                 pass_progress = true;
             }
         }
@@ -1403,37 +1588,51 @@ bool preserve_feature_edges_v2(
                 continue;
             }
 
-            FeatureEdgePreservationResult trial = output;
             bool recovered = false;
+            std::vector<std::uint32_t> path;
             if (options.enable_edge_swaps &&
                 try_direct_two_to_three_swap(
-                    trial, first->mesh_point_id, second->mesh_point_id, options)) {
+                    output, first->mesh_point_id, second->mesh_point_id,
+                    options)) {
                 recovered = true;
+                path = {first->mesh_point_id, second->mesh_point_id};
             }
-            std::vector<std::uint32_t> path;
             if (!recovered && options.enable_forced_splits) {
-                recovered = recover_by_robust_walk(
-                    trial, first->mesh_point_id, second->mesh_point_id,
-                    facet_mesh.points[feature.point_ids[0]],
-                    facet_mesh.points[feature.point_ids[1]], options, path);
+                {
+                    LocalEditJournal journal(output);
+                    recovered = recover_by_robust_walk(
+                        output, first->mesh_point_id, second->mesh_point_id,
+                        facet_mesh.points[feature.point_ids[0]],
+                        facet_mesh.points[feature.point_ids[1]], options,
+                        journal, path);
+                    if (recovered) {
+                        journal.commit();
+                    } else {
+                        journal.rollback();
+                        ++output.rollback_count;
+                    }
+                }
                 if (!recovered) {
-                    FeatureEdgePreservationResult reverse_trial = output;
+                    LocalEditJournal reverse_journal(output);
                     std::vector<std::uint32_t> reverse_path;
                     recovered = recover_by_robust_walk(
-                        reverse_trial, second->mesh_point_id, first->mesh_point_id,
+                        output, second->mesh_point_id, first->mesh_point_id,
                         facet_mesh.points[feature.point_ids[1]],
                         facet_mesh.points[feature.point_ids[0]], options,
-                        reverse_path);
+                        reverse_journal, reverse_path);
                     if (recovered) {
-                        trial = std::move(reverse_trial);
+                        reverse_journal.commit();
                         std::reverse(reverse_path.begin(), reverse_path.end());
                         path = std::move(reverse_path);
+                    } else {
+                        reverse_journal.rollback();
+                        ++output.rollback_count;
                     }
                 }
             }
             if (recovered) {
                 if (path.empty() && !find_line_path(
-                        trial.mesh, first->mesh_point_id, second->mesh_point_id,
+                        output.mesh, first->mesh_point_id, second->mesh_point_id,
                         facet_mesh.points[feature.point_ids[0]],
                         facet_mesh.points[feature.point_ids[1]],
                         path_tolerance, path)) {
@@ -1441,15 +1640,14 @@ bool preserve_feature_edges_v2(
                 }
             }
             if (recovered) {
-                PreservedFeatureEdge* trial_record = find_record(trial, feature_index);
-                if (trial_record != nullptr) {
-                    trial_record->state = FeatureEdgePreservationState::recovered;
-                    trial_record->mesh_path = std::move(path);
-                    output = std::move(trial);
+                PreservedFeatureEdge* recovered_record =
+                    find_record(output, feature_index);
+                if (recovered_record != nullptr) {
+                    recovered_record->state =
+                        FeatureEdgePreservationState::recovered;
+                    recovered_record->mesh_path = std::move(path);
                     pass_progress = true;
                 }
-            } else {
-                ++output.rollback_count;
             }
         }
         recompute_summary(output);
@@ -1484,6 +1682,18 @@ bool preserve_feature_edges_v2(
         return false;
     }
     return true;
+}
+
+bool preserve_feature_edges_v2(
+    const NodePreservationResult& node_result,
+    const FacetMesh& facet_mesh,
+    const FeatureTopology& features,
+    const FeatureEdgePreservationV2Options& options,
+    FeatureEdgePreservationResult& output,
+    std::string& error) {
+    NodePreservationResult owned = node_result;
+    return preserve_feature_edges_v2(
+        std::move(owned), facet_mesh, features, options, output, error);
 }
 
 }  // namespace geometry
